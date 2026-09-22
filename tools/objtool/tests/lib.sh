@@ -99,6 +99,20 @@ klp_preflight()
 	*AArch64*)		cc_arch=arm64 ;;
 	*)			cc_arch= ;;
 	esac
+
+	# Unlike the rest of FIXTURE_CFLAGS, -fcf-protection is not something
+	# the kernel always passes: it follows CONFIG_X86_KERNEL_IBT.  Left
+	# unset it is whatever $CC was configured with, and distributions
+	# disagree -- Ubuntu and newer Red Hat toolchains build with CET on,
+	# others leave it off.  That decides whether a fixture's functions
+	# carry an ENDBR64, which changes their instructions and so their
+	# checksums, so an unpinned default makes some tests pass or fail
+	# depending on who packaged the compiler.  Pin it, and let a test which
+	# is about IBT ask for a mode of its own.
+	FIXTURE_CF_PROTECTION=
+	$CC -fcf-protection=none -c -o "$tmp/probe.o" "$tmp/probe.c" 2>/dev/null &&
+		FIXTURE_CF_PROTECTION="-fcf-protection=none"
+
 	rm -rf "$tmp"
 
 	# Normalize to the kernel's SRCARCH.
@@ -120,7 +134,7 @@ klp_preflight()
 
 	KLP_TEST_ARCH="$arch"
 	KLP_TEST_PREFLIGHT=done
-	export OBJTOOL CC KLP_TEST_ARCH KLP_TEST_PREFLIGHT
+	export OBJTOOL CC KLP_TEST_ARCH KLP_TEST_PREFLIGHT FIXTURE_CF_PROTECTION
 
 	cc_version="$($CC --version 2>/dev/null | head -1)"
 	cat <<EOF
@@ -128,6 +142,7 @@ klp_preflight()
 #   objtool   $OBJTOOL (klp: yes)
 #   compiler  $cc_version
 #   arch      $KLP_TEST_ARCH$([ "$arch" = "$host" ] || echo "  (host $host, cross)")
+#   cet       ${FIXTURE_CF_PROTECTION:--fcf-protection not supported}
 #   tmpdir    ${TMPDIR:-/tmp}  (each test builds in a fresh directory here)
 EOF
 }
@@ -148,10 +163,15 @@ EOF
 #					.bss rather than being SHN_COMMON,
 #					which has no section and so no
 #					checksum
+#   -fcf-protection=none		pinned rather than inherited: see
+#					klp_preflight().  IBT is a config, not a
+#					constant, so the baseline takes the
+#					plainer codegen and tests/x86 covers the
+#					other setting explicitly.
 #
 # A test overrides it; see tools/objtool/Documentation/klp-write-tests.txt.
 FIXTURE_CFLAGS="-O2 -ffunction-sections -fdata-sections -fno-common \
-		-fno-asynchronous-unwind-tables"
+		-fno-asynchronous-unwind-tables ${FIXTURE_CF_PROTECTION:-}"
 
 test_name="$(basename "$0" .sh)"
 workdir=
@@ -422,6 +442,36 @@ cc_supports()
 	$CC $1 -c "$workdir/flagtest.c" -o "$workdir/flagtest.o" 2>/dev/null
 }
 
+# require_cf_protection <mode>
+#
+# For a test which is about IBT rather than merely subject to it.  The baseline
+# pins -fcf-protection=none, so such a test passes its own mode to build_pair()
+# and it wins by coming later on the command line.  Declare the dependency here
+# so a compiler without the flag skips rather than quietly testing the default.
+require_cf_protection()
+{
+	cc_supports "-fcf-protection=$1" ||
+		declared_skip "compiler does not support -fcf-protection=$1"
+}
+
+# has_endbr <object> <function>
+#
+# True when the function opens with ENDBR64.  Read the bytes rather than
+# disassembling: objcopy is already required for checksum_of(), objdump is not,
+# and the four-byte opcode is unambiguous.
+#
+# -ffunction-sections is what makes this addressable by name; a function
+# sharing .text with others would need its offset first.
+has_endbr()
+{
+	local bin="$workdir/endbr.bin"
+
+	$OBJCOPY -O binary --only-section=".text.$2" "$workdir/$1" "$bin" 2>/dev/null ||
+		return 1
+	[ -s "$bin" ] || return 1
+	[ "$(od -An -tx1 -N4 "$bin" | tr -d ' \n')" = "f30f1efa" ]
+}
+
 # partial_link <output> <object...>
 #
 # "ld -r" through the compiler driver so the link targets the same
@@ -606,6 +656,12 @@ re_quote() { printf '%s' "$1" | sed 's|[].[^$*\\/]|\\&|g'; }
 
 has_input_section() { in_sections "$1" | grep -q "[[:space:]]$(re_quote "$2")[[:space:]]"; }
 has_input_symbol()  { in_symbols "$1" | awk -v n="$2" '$NF == n' | grep -q .; }
+
+# sym_size <object> <symbol>
+#
+# The st_size readelf prints for a symbol, for a test asking how much a
+# function grew rather than merely whether it changed.
+sym_size() { in_symbols "$1" | awk -v n="$2" '$NF == n { print $3; exit }'; }
 
 assert_input_section()
 {
