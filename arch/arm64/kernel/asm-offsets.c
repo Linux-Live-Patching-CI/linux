@@ -23,6 +23,8 @@
 #include <asm/suspend.h>
 #include <linux/kbuild.h>
 #include <linux/arm-smccc.h>
+#include <asm/alternative.h>
+#include <asm/extable.h>
 
 int main(void)
 {
@@ -152,7 +154,7 @@ int main(void)
   DEFINE(ARM64_FTR_SYSVAL,	offsetof(struct arm64_ftr_reg, sys_val));
   BLANK();
 #ifdef CONFIG_UNMAP_KERNEL_AT_EL0
-  DEFINE(TRAMP_VALIAS,		TRAMP_VALIAS);
+  DEFINE(TRAMP_VALIAS_ASM,	TRAMP_VALIAS);
 #endif
 #ifdef CONFIG_ARM_SDE_INTERFACE
   DEFINE(SDEI_EVENT_INTREGS,	offsetof(struct sdei_registered_event, interrupted_regs));
@@ -184,5 +186,8 @@ int main(void)
 #endif
   DEFINE(PIE_E0_ASM, PIE_E0);
   DEFINE(PIE_E1_ASM, PIE_E1);
+  BLANK();
+  DEFINE(ALT_INSTR_SIZE,		sizeof(struct alt_instr));
+  DEFINE(EXTABLE_SIZE,			sizeof(struct exception_table_entry));
   return 0;
 }

@@ -58,9 +58,18 @@ struct section {
 	Elf_Data *data;
 	const char *name;
 	int idx;
-	bool _changed, text, rodata, noinstr, init, truncate;
+	u32 _changed			: 1,
+	    text			: 1,
+	    rodata			: 1,
+	    noinstr			: 1,
+	    init			: 1,
+	    truncate			: 1,
+	    data_owned			: 1,
+	    data_overallocated		: 1,
+	    relocs_overallocated	: 1;
+	    /* 23 bit hole */
+
 	struct reloc *relocs;
-	unsigned long nr_alloc_relocs;
 	struct section *twin;
 };
 
@@ -98,6 +107,7 @@ struct symbol {
 	u8 klp		     : 1;
 	u8 dont_correlate    : 1;
 	u8 fake		     : 1;
+	u8 unalign	     : 1;
 	struct list_head pv_target;
 	struct reloc *relocs;
 	struct section *group_sec;
@@ -122,6 +132,7 @@ struct elf {
 	struct list_head sections;
 	struct list_head symbols;
 	unsigned long num_relocs;
+	int pfe_offset;
 
 	int symbol_bits;
 	int symbol_name_bits;
@@ -177,9 +188,10 @@ struct symbol *elf_create_symbol(struct elf *elf, const char *name,
 struct symbol *elf_create_section_symbol(struct elf *elf, struct section *sec);
 
 void *elf_add_data(struct elf *elf, struct section *sec, const void *data,
-		   size_t size);
+		   size_t size, bool align);
 
-unsigned int elf_add_string(struct elf *elf, struct section *strtab, const char *str);
+int elf_find_string(struct elf *elf, struct section *strtab, const char *str);
+int elf_add_string(struct elf *elf, struct section *strtab, const char *str);
 
 struct reloc *elf_create_reloc(struct elf *elf, struct section *sec,
 			       unsigned long offset, struct symbol *sym,
@@ -220,6 +232,7 @@ struct reloc *find_reloc_by_dest(const struct elf *elf, struct section *sec, uns
 struct reloc *find_reloc_by_dest_range(const struct elf *elf, struct section *sec,
 				     unsigned long offset, unsigned int len);
 struct symbol *find_func_containing(struct section *sec, unsigned long offset);
+struct symbol *find_data_mapping_sym(struct section *sec, unsigned long offset);
 
 /*
  * Try to see if it's a whole archive (vmlinux.o or module).
@@ -284,6 +297,26 @@ static inline bool is_file_sym(struct symbol *sym)
 static inline bool is_notype_sym(struct symbol *sym)
 {
 	return sym->type == STT_NOTYPE;
+}
+
+/*
+ * ARM64 mapping symbols ($d, $x, $a, __pi_$d, etc) which mark transitions
+ * between code and data.
+ */
+static inline bool is_mapping_sym(struct symbol *sym)
+{
+	return is_notype_sym(sym) && strchr(sym->name, '$');
+}
+
+static inline bool is_data_mapping_sym(struct symbol *sym)
+{
+	const char *dollar;
+
+	if (!is_mapping_sym(sym))
+		return false;
+
+	dollar = strchr(sym->name, '$');
+	return dollar && dollar[1] == 'd';
 }
 
 static inline bool is_global_sym(struct symbol *sym)
@@ -497,6 +530,12 @@ static inline void set_sym_next_reloc(struct reloc *reloc, struct reloc *next)
 
 #define sec_for_each_sym(sec, sym)					\
 	list_for_each_entry(sym, &sec->symbol_list, list)
+
+#define sec_for_each_sym_from(sec, sym)					\
+	list_for_each_entry_from(sym, &sec->symbol_list, list)
+
+#define sec_for_each_sym_continue(sec, sym)				\
+	list_for_each_entry_continue(sym, &sec->symbol_list, list)
 
 #define sec_prev_sym(sym)						\
 	sym->sec && sym->list.prev != &sym->sec->symbol_list ?		\

@@ -1,26 +1,33 @@
 name: Set up a kernel build toolchain
 description: >
   Install the compiler a matrix entry names and report how to ask make for it.
-  Entries are named <compiler>-<major>, and everything else about them --
-  which packages, which make arguments -- follows from that, so a job's matrix
-  stays a list of names and the two jobs cannot drift apart.
+  Entries are named <compiler>-<major> or <compiler>-<major>-arm64, and
+  everything else about them -- which packages, which make arguments -- follows
+  from that, so a job's matrix stays a list of names and the two jobs cannot
+  drift apart.
 
 inputs:
   name:
-    description: 'Toolchain to install: gcc-<major> or clang-<major>'
+    description: 'Toolchain to install: gcc-<major>[-arm64] or clang-<major>[-arm64]'
     required: true
 
 outputs:
   make_args:
     description: >
-      The make argument selecting this toolchain.  Pass it as an argument, not
-      through the environment: the kernel's Makefile assigns CC itself and a
-      makefile assignment beats the environment, so an exported CC is ignored
-      and the build quietly uses the runner's default compiler.
+      The make arguments selecting this toolchain (and target, for cross
+      entries).  Pass them as arguments, not through the environment: the
+      kernel's Makefile assigns CC itself and a makefile assignment beats the
+      environment, so an exported CC is ignored and the build quietly uses the
+      runner's default compiler.
     value: ${{ steps.resolve.outputs.make_args }}
   major:
     description: The major version, for a job checking it got the compiler it asked for.
     value: ${{ steps.resolve.outputs.major }}
+  arch:
+    description: >
+      Target architecture when the entry is a cross build (arm64), otherwise
+      empty for a native host build.
+    value: ${{ steps.resolve.outputs.arch }}
 
 runs:
   using: composite
@@ -30,25 +37,53 @@ runs:
       run: |
         set -eu
         name='${{ inputs.name }}'
-        major=${name##*-}
+
+        # <compiler>-<major> or <compiler>-<major>-arm64.  Strip the optional
+        # arch suffix before taking the major, or ${name##*-} would return
+        # "arm64" for every cross entry.
+        arch=
+        base=$name
         case "$name" in
+        *-arm64)
+          arch=arm64
+          base=${name%-arm64}
+          ;;
+        esac
+        major=${base##*-}
+
+        case "$base" in
         gcc-*)
-          packages="gcc-$major"
-          # LLVM=-<major> is the kernel's spelling for a versioned LLVM
-          # toolchain; gcc has no equivalent, so name the compiler directly.
-          make_args="CC=gcc-$major"
+          if [ "$arch" = arm64 ]; then
+            # Versioned cross package; CROSS_COMPILE still supplies ld/readelf/
+            # objcopy via the unversioned triplet prefix.
+            packages="gcc-$major-aarch64-linux-gnu binutils-aarch64-linux-gnu"
+            make_args="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=aarch64-linux-gnu-gcc-$major"
+          else
+            packages="gcc-$major"
+            # LLVM=-<major> is the kernel's spelling for a versioned LLVM
+            # toolchain; gcc has no equivalent, so name the compiler directly.
+            make_args="CC=gcc-$major"
+          fi
           ;;
         clang-*)
           packages="clang-$major lld-$major llvm-$major"
-          # Picks up ld.lld, llvm-objcopy and llvm-readelf of the same version,
-          # which the objtool tests use as well as the kernel build.
-          make_args="LLVM=-$major"
+          if [ "$arch" = arm64 ]; then
+            # CROSS_COMPILE is what tools/scripts/Makefile.include turns into
+            # --target= for CLANG_CROSS_FLAGS; the fixtures need no sysroot, so
+            # the cross gcc package is optional and omitted.
+            make_args="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=-$major"
+          else
+            # Picks up ld.lld, llvm-objcopy and llvm-readelf of the same version,
+            # which the objtool tests use as well as the kernel build.
+            make_args="LLVM=-$major"
+          fi
           ;;
         *)
           echo "::error::unrecognised toolchain '$name'"; exit 1 ;;
         esac
         {
           echo "major=$major"
+          echo "arch=$arch"
           echo "packages=$packages"
           echo "make_args=$make_args"
         } >> "$GITHUB_OUTPUT"
