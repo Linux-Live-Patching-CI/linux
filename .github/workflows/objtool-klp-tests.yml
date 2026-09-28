@@ -14,7 +14,8 @@ on:
 #
 # Both matrices are a list of names; setup-toolchain turns a name into
 # packages and make arguments, so the two cannot disagree about what "gcc-11"
-# means.
+# or "gcc-13-arm64" means.  A trailing -arm64 selects aarch64 cross packages
+# and ARCH/CROSS_COMPILE; the kernel-build job stays on native names for now.
 
 jobs:
   objtool-tests:
@@ -25,7 +26,12 @@ jobs:
       # to cancel the others.
       fail-fast: false
       matrix:
-        name: [gcc-11, gcc-13, clang-18]
+        name:
+          - gcc-11
+          - gcc-13
+          - clang-18
+          - gcc-13-arm64
+          - clang-18-arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -53,6 +59,18 @@ jobs:
           *\ "$want".*) ;;
           *) echo "::error::fixtures built with '$got', expected major $want"; exit 1 ;;
           esac
+
+          # Same class of bug for the target: omitting ARCH/CROSS_COMPILE on an
+          # -arm64 entry would quietly run the host (x86) suite instead.
+          want_arch='${{ steps.tc.outputs.arch }}'
+          if [ -n "$want_arch" ]; then
+            got_arch=$(sed -n 's/^#   arch      //p' test.log)
+            echo "fixtures targeted: $got_arch"
+            case "$got_arch" in
+            "$want_arch"*) ;;
+            *) echo "::error::fixtures targeted '$got_arch', expected $want_arch"; exit 1 ;;
+            esac
+          fi
 
       - name: Collect failure artifacts
         if: failure()
