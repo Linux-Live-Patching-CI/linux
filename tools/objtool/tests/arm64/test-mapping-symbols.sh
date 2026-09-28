@@ -17,6 +17,10 @@
 # The fixture's added function is load-bearing: without it both sides have the
 # same number of $x symbols, positional matching succeeds, and removing the
 # fix changes nothing observable.
+#
+# Toolchains disagree on the spelling: gcc emits bare "$x", clang emits
+# "$x.0", "$x.1", ….  Match either form, the same way is_mapping_sym() keys
+# off '$' rather than an exact name.
 
 . "$(dirname "$0")/../lib.sh"
 
@@ -26,17 +30,16 @@ build_pair mapping_symbols.c
 # Premise: the toolchain emitted mapping symbols, and the patched object has
 # more of them than the original (from 'added'), so correlation by name cannot
 # get a 1:1 match.
-assert_input_symbol '$x'
-
 count_map()
 {
-	in_symbols "$1" | awk -v n="$2" '$4 == "NOTYPE" && $NF == n' | wc -l
+	# $x or $x.<n> (and __pi_$x…); NOTYPE keeps section symbols out.
+	in_symbols "$1" | awk '$4 == "NOTYPE" && $NF ~ /\$x(\.|$)/' | wc -l
 }
 
-n_orig=$(count_map "$orig_obj" '$x')
-n_patched=$(count_map "$patched_obj" '$x')
+n_orig=$(count_map "$orig_obj")
+n_patched=$(count_map "$patched_obj")
 [ "$n_orig" -gt 0 ] && [ "$n_patched" -gt "$n_orig" ] ||
-	fail "expected more \$x in patched than orig (orig=$n_orig patched=$n_patched)"
+	fail "expected more \$x* in patched than orig (orig=$n_orig patched=$n_patched)"
 
 run_diff
 
