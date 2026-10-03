@@ -1564,6 +1564,277 @@ static int clone_reloc(struct elfs *e, struct reloc *patched_reloc,
 	return 0;
 }
 
+/*
+ * IBT sealing and function pointers created by the patch
+ * =======================================================
+ *
+ * With CONFIG_X86_KERNEL_IBT, "objtool --ibt" over vmlinux.o (or a module)
+ * lists in .ibt_endbr_seal every ENDBR64 whose function nothing takes the
+ * address of.  At boot, or at module load, apply_seal_endbr() overwrites each
+ * listed ENDBR64 with a NOP, which "seals" the function against indirect
+ * calls.  With FineIBT the function's kCFI hash is poisoned too.  The kernel
+ * makes that decision once, for the kernel as it was built, and nothing
+ * reverses it later.
+ *
+ * A livepatch can create a new function pointer, such as "ops->cb = foo" or
+ * "return &foo", to a function which the patch leaves unchanged.  klp diff
+ * does not clone unchanged functions, so the pointer resolves to the running
+ * kernel's copy of foo() through a klp relocation.  If the original kernel
+ * never took foo()'s address, that copy was sealed.  The first indirect call
+ * through the new pointer then takes a #CP on IBT hardware, or fails the
+ * poisoned hash check under kCFI or FineIBT.  Nothing checks for this at
+ * build time: the patch module's own objtool pass cannot see through a klp
+ * relocation, and the kernel does not unseal anything at load time.
+ *
+ * klp diff sees one object and cannot know whether another object in the
+ * kernel took the address and kept the ENDBR64 in use.  What it can do is
+ * narrow the reference down to the cases where sealing is possible, and warn
+ * about those:
+ *
+ *   1) The reference takes the function's address.  This is the rule
+ *      "objtool --ibt" uses to decide whether an ENDBR64 is in use: any
+ *      relocation other than a direct call or jump target in code, and any
+ *      relocation in data.  Entries in special sections (__mcount_loc,
+ *      .static_call_sites, ...) and .discard.* sections record locations, not
+ *      branch targets, and are ignored, as objtool ignores them.
+ *
+ *   2) It goes through a klp relocation to an unexported function in the
+ *      original kernel or module.  __ksymtab takes the address of every
+ *      exported function, so an exported function is never sealed.  Cloned
+ *      and new functions live in the patch module, whose own objtool pass
+ *      sees the new reference and keeps their ENDBR64.
+ *
+ *   3) The function has an ENDBR64 to seal.  For a function defined in this
+ *      object, look at its first instruction.  For an undefined (extern)
+ *      symbol, the object only tells us whether it was built with IBT at all.
+ *
+ *   4) The original object did not take the address itself.  If it did,
+ *      the original kernel kept the ENDBR64 and the new pointer is safe.
+ *      Undefined symbols carry no type, but an extern variable is safe here
+ *      too: the original can only reach one by a non-branch reference, which
+ *      counts as taking its address.
+ *
+ * In the cases that remain, whether it faults depends on the rest of the
+ * kernel, which the patch author, or klp-build with the original vmlinux.o
+ * in hand, can check.  The fix is to make the patch carry its own copy of the
+ * function (any change that alters the function's checksum does it), or to
+ * point at a function whose address is already taken.
+ */
+
+static void free_stack_ops(struct instruction *insn)
+{
+	struct stack_op *op, *next;
+
+	for (op = insn->stack_ops; op; op = next) {
+		next = op->next;
+		free(op);
+	}
+	insn->stack_ops = NULL;
+}
+
+/*
+ * Decode the instruction which covers @offset in @sec.  x86 has variable
+ * length instructions, so start decoding at the beginning of the containing
+ * function (or of the section, for code outside any function symbol) and
+ * walk forward until reaching it.
+ */
+static int decode_insn_at(struct elf *elf, struct section *sec,
+			  unsigned long offset, struct instruction *insn)
+{
+	/*
+	 * The decoder only reads file->elf, but struct objtool_file carries an
+	 * 8MB hash table, so keep a single one off the stack.
+	 */
+	static struct objtool_file *file;
+	unsigned long start = 0, off;
+	struct symbol *func;
+
+	if (!file) {
+		file = calloc(1, sizeof(*file));
+		if (!file)
+			return -1;
+	}
+	file->elf = elf;
+
+	func = find_func_containing(sec, offset);
+	if (func && func->sec == sec)
+		start = func->offset;
+
+	for (off = start; off < sec_size(sec); off += insn->len) {
+		memset(insn, 0, sizeof(*insn));
+		INIT_LIST_HEAD(&insn->call_node);
+		insn->sec = sec;
+		insn->offset = off;
+
+		if (arch_decode_instruction(file, sec, off, sec_size(sec) - off, insn))
+			return -1;
+		free_stack_ops(insn);
+
+		if (!insn->len)
+			return -1;
+		if (offset < off + insn->len)
+			return 0;
+	}
+
+	return -1;
+}
+
+static bool is_branch_insn(struct instruction *insn)
+{
+	switch (insn->type) {
+	case INSN_CALL:
+	case INSN_CALL_DYNAMIC:
+	case INSN_JUMP_CONDITIONAL:
+	case INSN_JUMP_UNCONDITIONAL:
+	case INSN_JUMP_DYNAMIC:
+	case INSN_JUMP_DYNAMIC_CONDITIONAL:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* Rule 1: does this relocation take the address of its target? */
+static bool reloc_takes_address(struct elf *elf, struct reloc *reloc)
+{
+	struct section *sec = reloc->sec->base;
+	struct instruction insn;
+
+	/* .debug_*, .comment and friends are never loaded */
+	if (!(sec->sh.sh_flags & SHF_ALLOC))
+		return false;
+
+	if (strstarts(sec->name, ".discard.") ||
+	    is_special_section(sec) || is_special_section_aux(sec))
+		return false;
+
+	if (!is_text_sec(sec))
+		return true;
+
+	/* Undecodable: assume the worst, as a false warning is cheap */
+	if (decode_insn_at(elf, sec, reloc_offset(reloc), &insn))
+		return true;
+
+	return !is_branch_insn(&insn) && insn.type != INSN_RETURN &&
+	       insn.type != INSN_NOP;
+}
+
+/* Does @reloc refer to @sym, by name or through its section symbol? */
+static bool reloc_refers_to(struct reloc *reloc, struct symbol *sym)
+{
+	if (reloc->sym == sym)
+		return true;
+
+	/*
+	 * A local symbol may be referenced through its section symbol instead.
+	 * klp-build compiles with -ffunction-sections, so the function's
+	 * section stands for the function.
+	 */
+	return !is_undef_sym(sym) && is_sec_sym(reloc->sym) &&
+	       reloc->sym->sec == sym->sec;
+}
+
+/* Does anything in @elf other than @sym itself take the address of @sym? */
+static bool address_taken(struct elf *elf, struct symbol *sym)
+{
+	struct section *sec;
+	struct reloc *reloc;
+
+	for_each_sec(elf, sec) {
+		if (!sec->rsec)
+			continue;
+
+		/* A function referring to itself is _THIS_IP_ and the like */
+		if (!is_undef_sym(sym) && sec == sym->sec)
+			continue;
+
+		for_each_reloc(sec->rsec, reloc) {
+			if (reloc_refers_to(reloc, sym) &&
+			    reloc_takes_address(elf, reloc))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+static bool func_has_endbr(struct elf *elf, struct symbol *func)
+{
+	struct instruction insn;
+
+	return !decode_insn_at(elf, func->sec, func->offset, &insn) &&
+	       insn.offset == func->offset && insn.type == INSN_ENDBR;
+}
+
+/*
+ * Was the object built with IBT?  -fcf-protection=branch gives every external
+ * function an ENDBR64, so under IBT at least one function has one.
+ */
+static bool object_has_endbr(struct elf *elf)
+{
+	static int cached = -1;
+	struct symbol *sym;
+
+	if (cached != -1)
+		return cached;
+
+	cached = 0;
+	for_each_sym(elf, sym) {
+		if (is_func_sym(sym) && !is_undef_sym(sym) &&
+		    func_has_endbr(elf, sym)) {
+			cached = 1;
+			break;
+		}
+	}
+
+	return cached;
+}
+
+/* Rules 2-4 for the target of an address-taking reference. */
+static bool maybe_sealed(struct elfs *e, struct reloc *patched_reloc)
+{
+	struct symbol *sym = patched_reloc->sym;
+	struct symbol *twin = sym->twin;
+
+	/* Rule 2 */
+	if (!klp_reloc_needed(patched_reloc) || find_export(sym) || !twin)
+		return false;
+
+	/* Rule 3 */
+	if (is_undef_sym(twin)) {
+		if (!object_has_endbr(e->orig))
+			return false;
+	} else {
+		if (!is_func_sym(twin) || !func_has_endbr(e->orig, twin))
+			return false;
+	}
+
+	/* Rule 4 */
+	return !address_taken(e->orig, twin);
+}
+
+static void check_sealed_target(struct elfs *e, struct symbol *patched_sym,
+				struct reloc *patched_reloc)
+{
+	struct symbol *target = patched_reloc->sym;
+	const char *modname;
+
+	if (!is_func_sym(target) && !is_undef_sym(target))
+		return;
+
+	if (!reloc_takes_address(e->patched, patched_reloc))
+		return;
+
+	if (!maybe_sealed(e, patched_reloc))
+		return;
+
+	modname = find_modname(e);
+
+	WARN("%s+0x%lx: new function pointer to %s(), which the patch does not clone.  If nothing in %s takes its address, IBT sealed it and an indirect call through this pointer will fault",
+	     patched_sym->name, reloc_offset(patched_reloc) - patched_sym->offset,
+	     target->name, modname ? modname : "the original");
+}
+
 /* Copy all relocs needed for a symbol's contents */
 static int clone_sym_relocs(struct elfs *e, struct symbol *patched_sym)
 {
@@ -1626,6 +1897,8 @@ static int clone_sym_relocs(struct elfs *e, struct symbol *patched_sym)
 			continue;
 
 		offset = out_sym->offset + (reloc_offset(patched_reloc) - patched_sym->offset);
+
+		check_sealed_target(e, patched_sym, patched_reloc);
 
 		if (clone_reloc(e, patched_reloc, out_sym->sec, offset))
 			return -1;
